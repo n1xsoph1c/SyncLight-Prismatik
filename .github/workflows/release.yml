@@ -38,7 +38,14 @@ jobs:
           pip install hidapi flask pystray pillow "pyinstaller>=6.0"
 
       - name: Install UPX
-        run: choco install upx -y
+        shell: pwsh
+        run: |
+          $r = Invoke-RestMethod "https://api.github.com/repos/upx/upx/releases/latest"
+          $url = ($r.assets | Where-Object { $_.name -like "*win64.zip" }).browser_download_url
+          Invoke-WebRequest $url -OutFile upx.zip
+          Expand-Archive upx.zip -DestinationPath upx_tmp
+          $exe = Get-ChildItem upx_tmp -Recurse -Filter upx.exe | Select-Object -First 1
+          Move-Item $exe.FullName C:\Windows\upx.exe
 
       - name: Install Inno Setup
         run: choco install innosetup -y
