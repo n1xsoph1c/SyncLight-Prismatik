@@ -67,6 +67,7 @@ var
 procedure DownloadAndInstallPrismatik();
 var
   Http: Variant;
+  Stream: Variant;
   JsonResp: string;
   UrlStart, UrlEnd: Integer;
   DownloadUrl, TmpFile: string;
@@ -103,7 +104,6 @@ begin
     Http.Send();
 
     // Write binary response to file using ADODB.Stream
-    var Stream: Variant;
     Stream := CreateOleObject('ADODB.Stream');
     Stream.Type_ := 1; // binary
     Stream.Open();
