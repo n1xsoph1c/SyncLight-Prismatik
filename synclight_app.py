@@ -27,7 +27,12 @@ GITHUB_REPO  = "n1xsoph1c/synclight"
 VENDOR_ID    = 0x1A86
 PRODUCT_ID   = 0xFE07
 TASK_NAME    = "SynclightBridge"
-CONFIG_PATH  = Path(__file__).parent / "synclight_config.json"
+def _app_dir() -> Path:
+    if getattr(sys, 'frozen', False):
+        return Path(os.environ.get('LOCALAPPDATA', '')) / 'SynclightBridge'
+    return Path(__file__).parent
+
+CONFIG_PATH  = _app_dir() / "synclight_config.json"
 
 DEFAULT_CONFIG = {
     "ip": "127.0.0.1",
@@ -42,6 +47,7 @@ config: dict = {}
 
 def load_config():
     global config
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     if CONFIG_PATH.exists():
         with open(CONFIG_PATH) as f:
             config = {**DEFAULT_CONFIG, **json.load(f)}
@@ -171,27 +177,27 @@ def restart_bridge():
 # ── Boot (Task Scheduler) ─────────────────────────────────────────────────────
 
 def set_boot(enabled: bool):
-    script_path = Path(__file__).resolve()
-    pythonw     = Path(sys.executable).parent / "pythonw.exe"
-    vbs_path    = script_path.parent / "start_synclight_app.vbs"
+    if getattr(sys, 'frozen', False):
+        exe = f'"{Path(sys.executable).resolve()}"'
+    else:
+        exe = f'"{Path(sys.executable).parent / "pythonw.exe"}" "{Path(__file__).resolve()}"'
 
     if enabled:
-        vbs_path.write_text(
-            f'Set oShell = CreateObject("WScript.Shell")\n'
-            f'oShell.Run """{pythonw}"" ""{script_path}""", 0, False\n'
+        # Remove any registry-based autostart set by the installer first
+        subprocess.run(
+            ["reg", "delete",
+             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+             "/v", "SynclightBridge", "/f"],
+            capture_output=True,
         )
         subprocess.run(
-            ["powershell", "-Command",
-             f'$a=New-ScheduledTaskAction -Execute "wscript.exe" -Argument "{vbs_path}";'
-             f'$t=New-ScheduledTaskTrigger -AtLogOn;'
-             f'$s=New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0;'
-             f'Register-ScheduledTask -TaskName "{TASK_NAME}" -Action $a -Trigger $t -Settings $s -Force'],
+            ["schtasks", "/Create", "/TN", TASK_NAME,
+             "/SC", "ONLOGON", "/TR", exe, "/RL", "HIGHEST", "/F"],
             capture_output=True,
         )
     else:
         subprocess.run(
-            ["powershell", "-Command",
-             f'Unregister-ScheduledTask -TaskName "{TASK_NAME}" -Confirm:$false'],
+            ["schtasks", "/Delete", "/TN", TASK_NAME, "/F"],
             capture_output=True,
         )
 

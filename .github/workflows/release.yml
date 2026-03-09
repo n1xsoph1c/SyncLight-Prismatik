@@ -1,0 +1,73 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract version
+        shell: bash
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "TAG=$GITHUB_REF_NAME" >> $GITHUB_ENV
+
+      - name: Patch version in source
+        shell: bash
+        run: |
+          sed -i "s/^VERSION      = \".*\"/VERSION      = \"$VERSION\"/" synclight_app.py
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: |
+          pip install hidapi flask pystray pillow "pyinstaller>=6.0"
+
+      - name: Install UPX
+        run: choco install upx -y
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y
+
+      - name: Generate icon
+        run: python build_icon.py
+
+      - name: Build with PyInstaller
+        run: pyinstaller synclight.spec --noconfirm
+
+      - name: Create output directory
+        run: mkdir -p dist_installer
+
+      - name: Compile Inno Setup installer
+        shell: cmd
+        run: |
+          "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAppVersion=%VERSION% installer\synclight_setup.iss
+
+      - name: Rename installer artifact
+        shell: bash
+        run: |
+          mv dist_installer/SynclightSetup.exe "dist_installer/SynclightSetup-${VERSION}.exe"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release create "$TAG" \
+            "dist_installer/SynclightSetup-${VERSION}.exe" \
+            --title "Synclight Bridge v${VERSION}" \
+            --generate-notes

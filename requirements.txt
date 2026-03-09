@@ -1,0 +1,4 @@
+hidapi
+flask
+pystray
+pillow
