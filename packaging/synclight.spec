@@ -1,22 +1,24 @@
 # -*- mode: python ; coding: utf-8 -*-
+# Run from repo root: pyinstaller build/synclight.spec --noconfirm
+from pathlib import Path
 from PyInstaller.utils.hooks import collect_data_files
+
+ROOT = Path(SPECPATH).parent  # repo root (one level above build/)
 
 block_cipher = None
 
 a = Analysis(
-    ['synclight_app.py'],
-    pathex=[],
+    [str(ROOT / 'synclight_app.py')],
+    pathex=[str(ROOT)],
     binaries=[],
     datas=(
         collect_data_files('flask') +
         collect_data_files('jinja2')
     ),
     hiddenimports=[
-        # pystray Windows backend
         'pystray._win32',
         'pystray._util',
         'pystray._util.win32',
-        # Flask 3.x split subpackages
         'flask.sansio',
         'flask.sansio.app',
         'flask.sansio.blueprints',
@@ -24,9 +26,7 @@ a = Analysis(
         'werkzeug.routing.rules',
         'werkzeug.routing.matcher',
         'werkzeug.routing.map',
-        # Pillow plugin
         'PIL.IcoImagePlugin',
-        # Indirect deps
         'blinker',
         'itsdangerous',
         'six',
@@ -59,7 +59,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='assets/icon.ico',
+    icon=str(ROOT / 'assets' / 'icon.ico'),
 )
 
 coll = COLLECT(

@@ -44,10 +44,10 @@ jobs:
         run: choco install innosetup -y
 
       - name: Generate icon
-        run: python build_icon.py
+        run: python packaging/build_icon.py
 
       - name: Build with PyInstaller
-        run: pyinstaller synclight.spec --noconfirm
+        run: pyinstaller packaging/synclight.spec --noconfirm
 
       - name: Create output directory
         run: mkdir -p dist_installer
