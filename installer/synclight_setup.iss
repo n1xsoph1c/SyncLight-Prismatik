@@ -80,21 +80,32 @@ begin
     Http.Send();
     JsonResp := Http.ResponseText;
 
-    // Find _x64_setup.exe download URL in JSON
-    UrlStart := Pos('_x64_setup.exe"', JsonResp);
+    // Find the 64-bit Windows setup URL: "Prismatik.unofficial.64bit.Setup.*.exe"
+    // Anchor on the stable part of the filename, then find the enclosing URL
+    UrlStart := Pos('64bit.Setup.', JsonResp);
     if UrlStart = 0 then
     begin
       MsgBox('Could not find Prismatik x64 installer URL. Please install manually from https://github.com/psieg/Lightpack/releases', mbError, MB_OK);
       Exit;
     end;
 
-    // Walk back to find the opening quote of the URL
-    UrlEnd := UrlStart + Length('_x64_setup.exe"') - 1;
+    // Walk forward to the closing .exe"
+    UrlEnd := UrlStart;
+    while (UrlEnd < Length(JsonResp) - 4) and
+          not ((JsonResp[UrlEnd]   = '.') and
+               (JsonResp[UrlEnd+1] = 'e') and
+               (JsonResp[UrlEnd+2] = 'x') and
+               (JsonResp[UrlEnd+3] = 'e') and
+               (JsonResp[UrlEnd+4] = '"')) do
+      UrlEnd := UrlEnd + 1;
+    UrlEnd := UrlEnd + 3; // point at last 'e' of .exe
+
+    // Walk back to the opening quote of https://
     while (UrlStart > 1) and (JsonResp[UrlStart] <> '"') do
       UrlStart := UrlStart - 1;
     UrlStart := UrlStart + 1;
 
-    DownloadUrl := Copy(JsonResp, UrlStart, UrlEnd - UrlStart);
+    DownloadUrl := Copy(JsonResp, UrlStart, UrlEnd - UrlStart + 1);
 
     TmpFile := ExpandConstant('{tmp}\PrismatikSetup_x64.exe');
 
