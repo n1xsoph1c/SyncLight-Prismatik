@@ -202,6 +202,9 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Synclight runtime files
+synclight_config.json
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
