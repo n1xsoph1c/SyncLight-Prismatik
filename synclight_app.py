@@ -10,6 +10,7 @@ import socket
 import json
 import os
 import sys
+import time
 import webbrowser
 import subprocess
 import urllib.request as urlreq
@@ -97,31 +98,58 @@ def bridge_loop():
     bridge_stop.clear()
     bridge_status["packets"] = 0
 
-    dev = open_synclight()
-    if not dev:
-        bridge_status["connected"] = False
-        return
-
-    hid_device = dev
-    bridge_status["connected"] = True
-
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(1.0)
     try:
         sock.bind((config["ip"], config["port"]))
     except Exception as e:
         bridge_status["connected"] = False
-        dev.close()
         return
 
+    dev = None
     last = (-1, -1, -1)
+    last_write_time = 0.0
+    KEEPALIVE_INTERVAL = 10.0  # resend color every 10s to detect stale handle
+
     while not bridge_stop.is_set():
+        # (Re)connect to HID device whenever it is absent
+        if dev is None:
+            bridge_status["connected"] = False
+            hid_device = None
+            try:
+                dev = open_synclight()
+            except Exception:
+                dev = None
+            if dev:
+                hid_device = dev
+                bridge_status["connected"] = True
+                last = (-1, -1, -1)  # force resend after reconnect
+                last_write_time = 0.0
+            else:
+                bridge_stop.wait(3.0)  # wait before retrying
+                continue
+
         try:
             data, _ = sock.recvfrom(4096)
         except socket.timeout:
+            # Keepalive: resend last known color to detect a stale/zombie handle
+            if last != (-1, -1, -1) and (time.monotonic() - last_write_time) >= KEEPALIVE_INTERVAL:
+                try:
+                    result = dev.write(b"\x00" + build_packet(*last))
+                    if result <= 0:
+                        raise IOError(f"keepalive write returned {result}")
+                    last_write_time = time.monotonic()
+                except Exception:
+                    try:
+                        dev.close()
+                    except Exception:
+                        pass
+                    dev = None
+                    bridge_status["connected"] = False
+                    hid_device = None
             continue
         except Exception:
-            break
+            continue
 
         # DRGB UDP: byte 0 = 0x02, byte 1 = timeout, then R,G,B per LED
         if len(data) < 5 or data[0] != 0x02:
@@ -138,18 +166,30 @@ def bridge_loop():
 
         if (r, g, b) != last:
             try:
-                dev.write(b"\x00" + build_packet(r, g, b))
+                result = dev.write(b"\x00" + build_packet(r, g, b))
+                if result <= 0:
+                    raise IOError(f"write returned {result}")
                 bridge_status["led_color"] = [r, g, b]
                 bridge_status["packets"]  += 1
                 last = (r, g, b)
+                last_write_time = time.monotonic()
             except Exception:
-                break
+                # HID write failed — device disconnected (e.g. USB event from controller)
+                try:
+                    dev.close()
+                except Exception:
+                    pass
+                dev = None
+                bridge_status["connected"] = False
+                hid_device = None
+                # Loop continues and will reconnect automatically
 
-    try:
-        dev.write(b"\x00" + build_packet(0, 0, 0))
-        dev.close()
-    except Exception:
-        pass
+    if dev:
+        try:
+            dev.write(b"\x00" + build_packet(0, 0, 0))
+            dev.close()
+        except Exception:
+            pass
 
     sock.close()
     bridge_status["connected"] = False
@@ -457,9 +497,22 @@ def run_tray():
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def _watchdog():
+    """Restart the bridge if its thread exits unexpectedly (not via stop_bridge)."""
+    import time
+    while True:
+        time.sleep(5)
+        if bridge_stop.is_set():
+            continue
+        if bridge_thread is None or not bridge_thread.is_alive():
+            start_bridge()
+
+
 def main():
     load_config()
     start_bridge()
+
+    threading.Thread(target=_watchdog, daemon=True, name="BridgeWatchdog").start()
 
     flask_thread = threading.Thread(
         target=lambda: app.run(
