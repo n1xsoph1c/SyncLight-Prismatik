@@ -23,11 +23,12 @@ from PIL import Image, ImageDraw
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-VERSION      = "1.0.0"
+VERSION      = "1.1.0"
 GITHUB_REPO  = "n1xsoph1c/synclight"
 VENDOR_ID    = 0x1A86
 PRODUCT_ID   = 0xFE07
 TASK_NAME    = "SynclightBridge"
+MAX_LEDS_PER_PACKET = 19  # max LEDs in one 64-byte HID report (58 data bytes / 3)
 def _app_dir() -> Path:
     if getattr(sys, 'frozen', False):
         return Path(os.environ.get('LOCALAPPDATA', '')) / 'SynclightBridge'
@@ -40,6 +41,7 @@ DEFAULT_CONFIG = {
     "port": 21324,
     "run_on_boot": False,
     "web_port": 8420,
+    "led_count": 80,
 }
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -69,17 +71,46 @@ hid_device   = None
 bridge_status = {"connected": False, "led_color": [0, 0, 0], "packets": 0}
 
 
-def build_packet(r: int, g: int, b: int) -> bytes:
+def build_multi_packet(led_colors: list, start_idx: int = 0) -> bytes:
+    """Build a 64-byte HID packet setting up to 19 LEDs starting at start_idx.
+
+    Protocol (reversed from USB capture of the official SyncLight app):
+      byte 0-1 : 0x52 0x42  magic 'RB'
+      byte 2   : N           number of LEDs in this packet
+      byte 3   : sequence counter (wraps 0-255)
+      byte 4   : 0x82        multi-LED command
+      byte 5   : start_idx   0-based first LED index
+      bytes 6+ : R G B for each LED (sequential, zeroed remainder)
+    """
     global _seq
+    n = min(len(led_colors), MAX_LEDS_PER_PACKET)
     pkt = bytearray(64)
-    pkt[0]=0x52; pkt[1]=0x42; pkt[2]=0x10; pkt[3]=_seq & 0xFF
-    pkt[4]=0x86; pkt[5]=0x01
-    pkt[6]=r & 0xFF; pkt[7]=g & 0xFF; pkt[8]=b & 0xFF
-    pkt[9]=0x4F; pkt[10]=0x50
-    pkt[11]=0x00; pkt[12]=0x00; pkt[13]=0x00; pkt[14]=0xFE
-    pkt[15] = sum(pkt[0:15]) & 0xFF
+    pkt[0] = 0x52; pkt[1] = 0x42
+    pkt[2] = n
+    pkt[3] = _seq & 0xFF
+    pkt[4] = 0x82
+    pkt[5] = start_idx & 0xFF
+    for i in range(n):
+        r, g, b = led_colors[i]
+        pkt[6 + i * 3]     = r & 0xFF
+        pkt[6 + i * 3 + 1] = g & 0xFF
+        pkt[6 + i * 3 + 2] = b & 0xFF
     _seq = (_seq + 1) & 0xFF
     return bytes(pkt)
+
+
+def send_led_colors(dev, colors: list) -> bool:
+    """Send per-LED colors to the device, splitting into multiple packets if needed.
+
+    colors: list of (r, g, b) tuples, one per SyncLight LED.
+    Returns True on success, False if a write error occurred.
+    """
+    for start in range(0, len(colors), MAX_LEDS_PER_PACKET):
+        chunk = colors[start: start + MAX_LEDS_PER_PACKET]
+        result = dev.write(b"\x00" + build_multi_packet(chunk, start_idx=start))
+        if result <= 0:
+            return False
+    return True
 
 
 def open_synclight():
@@ -107,9 +138,10 @@ def bridge_loop():
         return
 
     dev = None
-    last = (-1, -1, -1)
+    led_count = config.get("led_count", DEFAULT_CONFIG["led_count"])
+    last_colors: list = [(-1, -1, -1)] * led_count
     last_write_time = 0.0
-    KEEPALIVE_INTERVAL = 10.0  # resend color every 10s to detect stale handle
+    KEEPALIVE_INTERVAL = 10.0  # resend colors every 10s to detect stale handle
 
     while not bridge_stop.is_set():
         # (Re)connect to HID device whenever it is absent
@@ -123,7 +155,7 @@ def bridge_loop():
             if dev:
                 hid_device = dev
                 bridge_status["connected"] = True
-                last = (-1, -1, -1)  # force resend after reconnect
+                last_colors = [(-1, -1, -1)] * led_count  # force resend after reconnect
                 last_write_time = 0.0
             else:
                 bridge_stop.wait(3.0)  # wait before retrying
@@ -132,12 +164,14 @@ def bridge_loop():
         try:
             data, _ = sock.recvfrom(4096)
         except socket.timeout:
-            # Keepalive: resend last known color to detect a stale/zombie handle
-            if last != (-1, -1, -1) and (time.monotonic() - last_write_time) >= KEEPALIVE_INTERVAL:
+            # Keepalive: resend last known colors to detect a stale/zombie handle
+            has_data = any(r != -1 for r, g, b in last_colors)
+            if has_data and (time.monotonic() - last_write_time) >= KEEPALIVE_INTERVAL:
+                # Replace any un-initialised sentinel entries with black
+                safe = [(r, g, b) if r != -1 else (0, 0, 0) for r, g, b in last_colors]
                 try:
-                    result = dev.write(b"\x00" + build_packet(*last))
-                    if result <= 0:
-                        raise IOError(f"keepalive write returned {result}")
+                    if not send_led_colors(dev, safe):
+                        raise IOError("keepalive write returned non-positive")
                     last_write_time = time.monotonic()
                 except Exception:
                     try:
@@ -156,22 +190,30 @@ def bridge_loop():
             continue
 
         rgb_data = data[2:]
-        n = len(rgb_data) // 3
-        if n == 0:
+        n_src = len(rgb_data) // 3  # number of Prismatik LED zones
+        if n_src == 0:
             continue
 
-        r = sum(rgb_data[i * 3]     for i in range(n)) // n
-        g = sum(rgb_data[i * 3 + 1] for i in range(n)) // n
-        b = sum(rgb_data[i * 3 + 2] for i in range(n)) // n
+        # 1:1 map — Prismatik zone N → SyncLight LED N
+        # Use whichever count is smaller so a mismatch never causes an index error
+        n = min(n_src, led_count)
+        new_colors = [
+            (rgb_data[i * 3], rgb_data[i * 3 + 1], rgb_data[i * 3 + 2])
+            for i in range(n)
+        ]
+        # Pad with black if the strip has more LEDs than zones sent
+        if n < led_count:
+            new_colors += [(0, 0, 0)] * (led_count - n)
 
-        if (r, g, b) != last:
+        if new_colors != last_colors:
             try:
-                result = dev.write(b"\x00" + build_packet(r, g, b))
-                if result <= 0:
-                    raise IOError(f"write returned {result}")
-                bridge_status["led_color"] = [r, g, b]
+                if not send_led_colors(dev, new_colors):
+                    raise IOError("write returned non-positive")
+                # Show the middle LED's colour as the status swatch
+                mid = new_colors[len(new_colors) // 2]
+                bridge_status["led_color"] = list(mid)
                 bridge_status["packets"]  += 1
-                last = (r, g, b)
+                last_colors = new_colors
                 last_write_time = time.monotonic()
             except Exception:
                 # HID write failed — device disconnected (e.g. USB event from controller)
@@ -186,7 +228,7 @@ def bridge_loop():
 
     if dev:
         try:
-            dev.write(b"\x00" + build_packet(0, 0, 0))
+            send_led_colors(dev, [(0, 0, 0)] * led_count)
             dev.close()
         except Exception:
             pass
@@ -342,6 +384,12 @@ input:checked+.sl:before{transform:translateX(19px)}
         <input type="number" id="port" placeholder="21324">
       </div>
     </div>
+    <div class="row" style="margin-bottom:14px">
+      <div>
+        <label>SyncLight LED Count</label>
+        <input type="number" id="led_count" placeholder="80" min="1" max="80">
+      </div>
+    </div>
     <div class="togrow" style="margin-bottom:16px">
       <span class="toglabel">Run on System Boot</span>
       <label class="sw"><input type="checkbox" id="boot"><span class="sl"></span></label>
@@ -381,6 +429,7 @@ async function poll(){
     document.getElementById('listen').textContent=d.config.ip+':'+d.config.port;
     document.getElementById('ip').value=d.config.ip;
     document.getElementById('port').value=d.config.port;
+    document.getElementById('led_count').value=d.config.led_count;
     document.getElementById('boot').checked=d.config.run_on_boot;
     document.getElementById('ver').textContent=d.version;
   }catch(e){}
@@ -389,6 +438,7 @@ async function save(){
   await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({ip:document.getElementById('ip').value,
       port:parseInt(document.getElementById('port').value),
+      led_count:parseInt(document.getElementById('led_count').value)||80,
       run_on_boot:document.getElementById('boot').checked})});
   setTimeout(poll,1200);
 }
@@ -431,6 +481,9 @@ def api_save():
         changed = True
     if "port" in data:
         config["port"] = int(data["port"])
+        changed = True
+    if "led_count" in data:
+        config["led_count"] = max(1, int(data["led_count"]))
         changed = True
     if "run_on_boot" in data:
         set_boot(bool(data["run_on_boot"]))
