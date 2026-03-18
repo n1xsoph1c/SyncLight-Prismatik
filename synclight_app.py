@@ -28,7 +28,6 @@ GITHUB_REPO  = "n1xsoph1c/synclight"
 VENDOR_ID    = 0x1A86
 PRODUCT_ID   = 0xFE07
 TASK_NAME    = "SynclightBridge"
-MAX_LEDS_PER_PACKET = 19  # max LEDs in one 64-byte HID report (58 data bytes / 3)
 def _app_dir() -> Path:
     if getattr(sys, 'frozen', False):
         return Path(os.environ.get('LOCALAPPDATA', '')) / 'SynclightBridge'
@@ -71,43 +70,33 @@ hid_device   = None
 bridge_status = {"connected": False, "led_color": [0, 0, 0], "packets": 0}
 
 
-def build_multi_packet(led_colors: list, start_idx: int = 0) -> bytes:
-    """Build a 64-byte HID packet setting up to 19 LEDs starting at start_idx.
+def build_packet(r: int, g: int, b: int, led_idx: int = 1) -> bytes:
+    """Build one 64-byte HID control packet for a single LED.
 
-    Protocol (reversed from USB capture of the official SyncLight app):
-      byte 0-1 : 0x52 0x42  magic 'RB'
-      byte 2   : N           number of LEDs in this packet
-      byte 3   : sequence counter (wraps 0-255)
-      byte 4   : 0x82        multi-LED command
-      byte 5   : start_idx   0-based first LED index
-      bytes 6+ : R G B for each LED (sequential, zeroed remainder)
+    Uses the same proven format as synclight_prismatik.py — byte 4 = 0x86,
+    byte 5 = 1-based LED index.  The device accepts one packet per LED.
     """
     global _seq
-    n = min(len(led_colors), MAX_LEDS_PER_PACKET)
     pkt = bytearray(64)
-    pkt[0] = 0x52; pkt[1] = 0x42
-    pkt[2] = n
-    pkt[3] = _seq & 0xFF
-    pkt[4] = 0x82
-    pkt[5] = start_idx & 0xFF
-    for i in range(n):
-        r, g, b = led_colors[i]
-        pkt[6 + i * 3]     = r & 0xFF
-        pkt[6 + i * 3 + 1] = g & 0xFF
-        pkt[6 + i * 3 + 2] = b & 0xFF
+    pkt[0]  = 0x52; pkt[1]  = 0x42; pkt[2]  = 0x10
+    pkt[3]  = _seq & 0xFF
+    pkt[4]  = 0x86; pkt[5]  = led_idx & 0xFF
+    pkt[6]  = r & 0xFF; pkt[7]  = g & 0xFF; pkt[8]  = b & 0xFF
+    pkt[9]  = 0x4F; pkt[10] = 0x50
+    pkt[11] = 0x00; pkt[12] = 0x00; pkt[13] = 0x00; pkt[14] = 0xFE
+    pkt[15] = sum(pkt[0:15]) & 0xFF
     _seq = (_seq + 1) & 0xFF
     return bytes(pkt)
 
 
 def send_led_colors(dev, colors: list) -> bool:
-    """Send per-LED colors to the device, splitting into multiple packets if needed.
+    """Send per-LED colors — one HID packet per LED (1-based index).
 
     colors: list of (r, g, b) tuples, one per SyncLight LED.
-    Returns True on success, False if a write error occurred.
+    Returns True on success, False if any write failed.
     """
-    for start in range(0, len(colors), MAX_LEDS_PER_PACKET):
-        chunk = colors[start: start + MAX_LEDS_PER_PACKET]
-        result = dev.write(b"\x00" + build_multi_packet(chunk, start_idx=start))
+    for idx, (r, g, b) in enumerate(colors, start=1):
+        result = dev.write(b"\x00" + build_packet(r, g, b, led_idx=idx))
         if result <= 0:
             return False
     return True
