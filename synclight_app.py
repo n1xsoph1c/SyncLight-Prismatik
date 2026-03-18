@@ -70,34 +70,53 @@ hid_device   = None
 bridge_status = {"connected": False, "led_color": [0, 0, 0], "packets": 0}
 
 
-def build_packet(r: int, g: int, b: int, led_idx: int = 1) -> bytes:
-    """Build one 64-byte HID control packet for a single LED.
-
-    Uses the same proven format as synclight_prismatik.py — byte 4 = 0x86,
-    byte 5 = 1-based LED index.  The device accepts one packet per LED.
-    """
-    global _seq
-    pkt = bytearray(64)
-    pkt[0]  = 0x52; pkt[1]  = 0x42; pkt[2]  = 0x10
-    pkt[3]  = _seq & 0xFF
-    pkt[4]  = 0x86; pkt[5]  = led_idx & 0xFF
-    pkt[6]  = r & 0xFF; pkt[7]  = g & 0xFF; pkt[8]  = b & 0xFF
-    pkt[9]  = 0x4F; pkt[10] = 0x50
-    pkt[11] = 0x00; pkt[12] = 0x00; pkt[13] = 0x00; pkt[14] = 0xFE
-    pkt[15] = sum(pkt[0:15]) & 0xFF
-    _seq = (_seq + 1) & 0xFF
-    return bytes(pkt)
+def send_init(dev) -> bool:
+    """Send the two initialization commands the original SyncLight app sends on connect."""
+    # cmd 0x82: mode/brightness, value 0x1e
+    pkt1 = bytearray(64)
+    pkt1[0]=0x52; pkt1[1]=0x42; pkt1[2]=0x06; pkt1[3]=0x02
+    pkt1[4]=0x82; pkt1[5]=0x1e
+    if dev.write(b"\x00" + bytes(pkt1)) <= 0:
+        return False
+    # cmd 0x93: config, value 0x31
+    pkt2 = bytearray(64)
+    pkt2[0]=0x52; pkt2[1]=0x42; pkt2[2]=0x07; pkt2[3]=0x03
+    pkt2[4]=0x93; pkt2[5]=0x00; pkt2[6]=0x31
+    return dev.write(b"\x00" + bytes(pkt2)) > 0
 
 
 def send_led_colors(dev, colors: list) -> bool:
-    """Send per-LED colors — one HID packet per LED (1-based index).
+    """Send all LED colors using the original SC (53 43) multi-packet protocol.
 
-    colors: list of (r, g, b) tuples, one per SyncLight LED.
-    Returns True on success, False if any write failed.
+    Exactly matches the format captured from the original SyncLight app:
+      Packet 1 header (7 bytes): 53 43 00 [N*3] [seq] 80 01
+      Followed by raw R,G,B bytes for all N LEDs, split across 64-byte packets.
+    For 80 LEDs this requires 4 packets (ceil((7 + 240) / 64) = 4).
     """
-    for idx, (r, g, b) in enumerate(colors, start=1):
-        result = dev.write(b"\x00" + build_packet(r, g, b, led_idx=idx))
-        if result <= 0:
+    global _seq
+
+    n = len(colors)
+    data_len = n * 3
+
+    # Total buffer: 7-byte header + RGB data, zero-padded to a multiple of 64
+    total = 7 + data_len
+    num_packets = (total + 63) // 64
+    buf = bytearray(num_packets * 64)
+
+    buf[0] = 0x53; buf[1] = 0x43; buf[2] = 0x00
+    buf[3] = data_len & 0xFF   # 0xb1 for 59 LEDs, 0xf0 for 80 LEDs, etc.
+    buf[4] = _seq & 0xFF
+    buf[5] = 0x80; buf[6] = 0x01
+
+    for i, (r, g, b) in enumerate(colors):
+        off = 7 + i * 3
+        buf[off] = r & 0xFF; buf[off+1] = g & 0xFF; buf[off+2] = b & 0xFF
+
+    _seq = (_seq + 1) & 0xFF
+
+    for p in range(num_packets):
+        chunk = bytes(buf[p*64:(p+1)*64])
+        if dev.write(b"\x00" + chunk) <= 0:
             return False
     return True
 
@@ -144,6 +163,7 @@ def bridge_loop():
             if dev:
                 hid_device = dev
                 bridge_status["connected"] = True
+                send_init(dev)  # mirror what the original app sends on connect
                 last_colors = [(-1, -1, -1)] * led_count  # force resend after reconnect
                 last_write_time = 0.0
             else:
