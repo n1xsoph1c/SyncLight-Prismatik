@@ -124,9 +124,7 @@ def bridge_loop():
 
     dev = None
     led_count = config.get("led_count", DEFAULT_CONFIG["led_count"])
-    last_colors: list = [(-1, -1, -1)] * led_count
-    last_write_time = 0.0
-    KEEPALIVE_INTERVAL = 10.0  # resend colors every 10s to detect stale handle
+    last_colors: list = []
 
     while not bridge_stop.is_set():
         # (Re)connect to HID device whenever it is absent
@@ -140,32 +138,14 @@ def bridge_loop():
             if dev:
                 hid_device = dev
                 bridge_status["connected"] = True
-                last_colors = [(-1, -1, -1)] * led_count  # force resend after reconnect
-                last_write_time = 0.0
+                last_colors = []
             else:
-                bridge_stop.wait(3.0)  # wait before retrying
+                bridge_stop.wait(3.0)
                 continue
 
         try:
             data, _ = sock.recvfrom(4096)
         except socket.timeout:
-            # Keepalive: resend last known colors to detect a stale/zombie handle
-            has_data = any(r != -1 for r, g, b in last_colors)
-            if has_data and (time.monotonic() - last_write_time) >= KEEPALIVE_INTERVAL:
-                # Replace any un-initialised sentinel entries with black
-                safe = [(r, g, b) if r != -1 else (0, 0, 0) for r, g, b in last_colors]
-                try:
-                    if not send_led_colors(dev, safe):
-                        raise IOError("keepalive write returned non-positive")
-                    last_write_time = time.monotonic()
-                except Exception:
-                    try:
-                        dev.close()
-                    except Exception:
-                        pass
-                    dev = None
-                    bridge_status["connected"] = False
-                    hid_device = None
             continue
         except Exception:
             continue
@@ -175,45 +155,43 @@ def bridge_loop():
             continue
 
         rgb_data = data[2:]
-        n_src = len(rgb_data) // 3  # number of Prismatik LED zones
+        n_src = len(rgb_data) // 3
         if n_src == 0:
             continue
 
-        # 1:1 map — Prismatik zone N → SyncLight LED N
-        # Use whichever count is smaller so a mismatch never causes an index error
         n = min(n_src, led_count)
         new_colors = [
             (rgb_data[i * 3], rgb_data[i * 3 + 1], rgb_data[i * 3 + 2])
             for i in range(n)
         ]
-        # Pad with black if the strip has more LEDs than zones sent
         if n < led_count:
             new_colors += [(0, 0, 0)] * (led_count - n)
 
-        if new_colors != last_colors:
+        if new_colors == last_colors:
+            continue
+
+        try:
+            if not send_led_colors(dev, new_colors):
+                raise IOError("write returned non-positive")
+            mid = new_colors[len(new_colors) // 2]
+            bridge_status["led_color"] = list(mid)
+            bridge_status["packets"]  += 1
+            last_colors = new_colors
+        except Exception:
             try:
-                if not send_led_colors(dev, new_colors):
-                    raise IOError("write returned non-positive")
-                # Show the middle LED's colour as the status swatch
-                mid = new_colors[len(new_colors) // 2]
-                bridge_status["led_color"] = list(mid)
-                bridge_status["packets"]  += 1
-                last_colors = new_colors
-                last_write_time = time.monotonic()
+                dev.close()
             except Exception:
-                # HID write failed — device disconnected (e.g. USB event from controller)
-                try:
-                    dev.close()
-                except Exception:
-                    pass
-                dev = None
-                bridge_status["connected"] = False
-                hid_device = None
-                # Loop continues and will reconnect automatically
+                pass
+            dev = None
+            bridge_status["connected"] = False
+            hid_device = None
 
     if dev:
         try:
             send_led_colors(dev, [(0, 0, 0)] * led_count)
+        except Exception:
+            pass
+        try:
             dev.close()
         except Exception:
             pass
