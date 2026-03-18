@@ -140,7 +140,7 @@ def bridge_loop():
             if dev:
                 hid_device = dev
                 bridge_status["connected"] = True
-last_colors = [(-1, -1, -1)] * led_count  # force resend after reconnect
+                last_colors = [(-1, -1, -1)] * led_count  # force resend after reconnect
                 last_write_time = 0.0
             else:
                 bridge_stop.wait(3.0)  # wait before retrying
