@@ -23,7 +23,7 @@ from PIL import Image, ImageDraw
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-VERSION      = "1.1.0"
+VERSION      = "1.1.1"
 GITHUB_REPO  = "n1xsoph1c/synclight"
 VENDOR_ID    = 0x1A86
 PRODUCT_ID   = 0xFE07
