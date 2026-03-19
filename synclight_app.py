@@ -40,7 +40,11 @@ DEFAULT_CONFIG = {
     "port": 21324,
     "run_on_boot": False,
     "web_port": 8420,
+    "zone_offset": 0,    # shift zone start by N positions (wraps around)
+    "zone_reverse": False,  # reverse zone traversal direction
+    "color_order": "RGB",
     "led_count": 80,
+    "debug_view": False,
 }
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -63,39 +67,124 @@ def save_config():
 
 # ── Bridge ────────────────────────────────────────────────────────────────────
 
-_seq         = 0
+# Node protocol constants (ported from deobfuscated SyncLight app)
+DEFAULT_LED_COUNT = 80
+
+_cmd_seq     = 1
 bridge_stop  = threading.Event()
 bridge_thread: threading.Thread | None = None
 hid_device   = None
-bridge_status = {"connected": False, "led_color": [0, 0, 0], "packets": 0}
+bridge_socket: socket.socket | None = None
+bridge_lock = threading.Lock()
+bridge_status = {"connected": False, "led_color": [0, 0, 0], "packets": 0, "input_colors": [], "output_colors": [], "mapping_indices": []}
 
 
-def build_packet(r: int, g: int, b: int, led_idx: int = 1) -> bytes:
-    """Build one 64-byte HID packet using the same format as synclight_prismatik.py.
-
-    byte 4 = 0x86, byte 5 = 1-based LED index.
-    led_idx=1 with this format sets all LEDs to the same colour (broadcast).
-    Varying led_idx 1..N addresses individual LEDs.
-    """
-    global _seq
-    pkt = bytearray(64)
-    pkt[0]  = 0x52; pkt[1]  = 0x42; pkt[2]  = 0x10
-    pkt[3]  = _seq & 0xFF
-    pkt[4]  = 0x86; pkt[5]  = led_idx & 0xFF
-    pkt[6]  = r & 0xFF; pkt[7]  = g & 0xFF; pkt[8]  = b & 0xFF
-    pkt[9]  = 0x4F; pkt[10] = 0x50
-    pkt[11] = 0x00; pkt[12] = 0x00; pkt[13] = 0x00; pkt[14] = 0xFE
-    pkt[15] = sum(pkt[0:15]) & 0xFF
-    _seq = (_seq + 1) & 0xFF
-    return bytes(pkt)
+def get_led_count() -> int:
+  try:
+    value = int(config.get("led_count", DEFAULT_LED_COUNT))
+  except (TypeError, ValueError):
+    value = DEFAULT_LED_COUNT
+  return max(1, min(240, value))
 
 
-def send_led_colors(dev, colors: list) -> bool:
-    """Send per-LED colors — one HID packet per LED (1-based index)."""
-    for idx, (r, g, b) in enumerate(colors, start=1):
-        if dev.write(b"\x00" + build_packet(r, g, b, led_idx=idx)) <= 0:
-            return False
+def _safe_int(value, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    if min_value is not None:
+        parsed = max(min_value, parsed)
+    if max_value is not None:
+        parsed = min(max_value, parsed)
+    return parsed
+
+
+def _next_cmd_id() -> int:
+  global _cmd_seq
+  _cmd_seq += 1
+  if _cmd_seq >= 255:
+    _cmd_seq = 1
+  return _cmd_seq
+
+
+def _apply_color_order(r: int, g: int, b: int) -> tuple[int, int, int]:
+  order = config.get("color_order", "RGB")
+  if order == "GRB":
+    return g & 0xFF, r & 0xFF, b & 0xFF
+  if order == "BGR":
+    return b & 0xFF, g & 0xFF, r & 0xFF
+  if order == "RBG":
+    return r & 0xFF, b & 0xFF, g & 0xFF
+  if order == "GBR":
+    return g & 0xFF, b & 0xFF, r & 0xFF
+  if order == "BRG":
+    return b & 0xFF, r & 0xFF, g & 0xFF
+  return r & 0xFF, g & 0xFF, b & 0xFF
+
+
+def _resample_leds(led_colors: list) -> list[tuple[int, int, int]]:
+  led_count = get_led_count()
+  n = len(led_colors)
+  if n == led_count:
+    return led_colors
+  if n == 0:
+    return [(0, 0, 0)] * led_count
+  return [
+    led_colors[min(int(i * n / led_count), n - 1)]
+    for i in range(led_count)
+  ]
+
+
+def _build_sync_sections(led_colors: list) -> bytearray:
+  led_count = get_led_count()
+  colors = [_apply_color_order(r, g, b) for r, g, b in _resample_leds(led_colors)]
+  sections = bytearray()
+  start = 1
+  run_color = colors[0]
+
+  for index in range(2, led_count + 1):
+    color = colors[index - 1]
+    if color == run_color:
+      continue
+    sections.extend([start, run_color[0], run_color[1], run_color[2], index - 1])
+    start = index
+    run_color = color
+
+  sections.extend([start, run_color[0], run_color[1], run_color[2], led_count])
+  return sections
+
+
+def _build_sync_packet(led_colors: list) -> bytes:
+  sections = _build_sync_sections(led_colors)
+  packet_len = 7 + len(sections)
+  packet = bytearray(packet_len)
+  packet[0] = 0x53  # 'S'
+  packet[1] = 0x43  # 'C'
+  packet[2] = (packet_len >> 8) & 0xFF
+  packet[3] = packet_len & 0xFF
+  packet[4] = _next_cmd_id()
+  packet[5] = 0x80
+  packet[6 : 6 + len(sections)] = sections
+  packet[-1] = sum(packet[:-1]) & 0xFF
+  return bytes(packet)
+
+
+def _write_chunked_hid(dev, payload: bytes) -> bool:
+  try:
+    for offset in range(0, len(payload), 64):
+      chunk = payload[offset : offset + 64]
+      bytes_written = dev.write(b"\x00" + chunk)
+      if bytes_written <= 0:
+        return False
     return True
+  except Exception:
+    return False
+
+
+def send_sc_frame(dev, led_colors: list) -> bool:
+  """Send per-LED colors using the app's native setSyncScreen packet format."""
+  packet = _build_sync_packet(led_colors)
+  return _write_chunked_hid(dev, packet)
 
 
 def open_synclight():
@@ -105,119 +194,121 @@ def open_synclight():
     target = next((d for d in ifaces if d.get("usage_page", 0) != 0x0001), ifaces[0])
     d = hid.device()
     d.open_path(target["path"])
-    d.set_nonblocking(1)
+    d.set_nonblocking(0)  # Must be blocking to prevent packet drops and hardware desync!
     return d
 
 
 def bridge_loop():
-    global hid_device
+    global hid_device, bridge_socket
     bridge_stop.clear()
     bridge_status["packets"] = 0
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(1.0)
-    try:
-        sock.bind((config["ip"], config["port"]))
-    except Exception as e:
+    dev = open_synclight()
+    if dev is None:
         bridge_status["connected"] = False
         return
 
-    dev = None
-    led_count = config.get("led_count", DEFAULT_CONFIG["led_count"])
-    last_colors: list = []
+    hid_device = dev
+    bridge_status["connected"] = True
 
-    while not bridge_stop.is_set():
-        # (Re)connect to HID device whenever it is absent
-        if dev is None:
-            bridge_status["connected"] = False
-            hid_device = None
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 262144)
+    sock.settimeout(0.5)
+    sock.bind((config["ip"], config["port"]))
+    bridge_socket = sock
+
+    last_mapped = []
+    last_map_key = None
+    cached_zone_indices = []
+
+    try:
+        while not bridge_stop.is_set():
             try:
-                dev = open_synclight()
-            except Exception:
-                dev = None
-            if dev:
-                hid_device = dev
-                bridge_status["connected"] = True
-                last_colors = []
-            else:
-                bridge_stop.wait(3.0)
+                data, _ = sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            # DRGB: byte 0 = 0x02, byte 1 = timeout, then R,G,B per LED
+            if len(data) < 5 or data[0] != 0x02:
                 continue
 
-        try:
-            data, _ = sock.recvfrom(4096)
-        except socket.timeout:
-            continue
-        except Exception:
-            continue
+            rgb_data = data[2:]
+            n_src = len(rgb_data) // 3
+            if n_src == 0:
+                continue
 
-        # DRGB UDP: byte 0 = 0x02, byte 1 = timeout, then R,G,B per LED
-        if len(data) < 5 or data[0] != 0x02:
-            continue
+            # Map Prismatik zones → device LEDs (configurable led_count)
+            offset  = config.get("zone_offset", 0)
+            reverse = config.get("zone_reverse", False)
+            led_count = get_led_count()
+            map_key = (n_src, led_count, offset, reverse)
 
-        rgb_data = data[2:]
-        n_src = len(rgb_data) // 3
-        if n_src == 0:
-            continue
+            if map_key != last_map_key:
+                cached_zone_indices = []
+                for i in range(led_count):
+                    idx = int(((i + 0.5) * n_src) / led_count)
+                    idx = max(0, min(n_src - 1, idx))
+                    if reverse:
+                        idx = n_src - 1 - idx
+                    cached_zone_indices.append((idx + offset) % n_src)
+                last_map_key = map_key
 
-        n = min(n_src, led_count)
-        new_colors = [
-            (rgb_data[i * 3], rgb_data[i * 3 + 1], rgb_data[i * 3 + 2])
-            for i in range(n)
-        ]
-        if n < led_count:
-            new_colors += [(0, 0, 0)] * (led_count - n)
+            mapped = [
+                (rgb_data[idx * 3], rgb_data[idx * 3 + 1], rgb_data[idx * 3 + 2])
+                for idx in cached_zone_indices
+            ]
 
-        if new_colors == last_colors:
-            continue
+            if mapped != last_mapped:
+                send_sc_frame(dev, mapped)
+                mid = mapped[len(mapped) // 2]
+                bridge_status["led_color"] = list(mid)
+                bridge_status["packets"] += 1
+                if config.get("debug_view", False):
+                    bridge_status["input_colors"] = [(rgb_data[i * 3], rgb_data[i * 3 + 1], rgb_data[i * 3 + 2]) for i in range(n_src)]
+                    bridge_status["output_colors"] = mapped
+                    bridge_status["mapping_indices"] = cached_zone_indices
+                last_mapped = mapped
 
-        try:
-            if not send_led_colors(dev, new_colors):
-                raise IOError("write returned non-positive")
-            mid = new_colors[len(new_colors) // 2]
-            bridge_status["led_color"] = list(mid)
-            bridge_status["packets"]  += 1
-            last_colors = new_colors
-        except Exception:
-            try:
-                dev.close()
-            except Exception:
-                pass
-            dev = None
-            bridge_status["connected"] = False
-            hid_device = None
-
-    if dev:
-        try:
-            send_led_colors(dev, [(0, 0, 0)] * led_count)
-        except Exception:
-            pass
-        try:
-            dev.close()
-        except Exception:
-            pass
-
-    sock.close()
-    bridge_status["connected"] = False
-    hid_device = None
+    except Exception:
+        pass
+    finally:
+        send_sc_frame(dev, [(0, 0, 0)] * get_led_count())
+        dev.close()
+        sock.close()
+        bridge_socket = None
+        bridge_status["connected"] = False
+        hid_device = None
 
 
-def start_bridge():
+def start_bridge() -> bool:
     global bridge_thread
     if bridge_thread and bridge_thread.is_alive():
-        return
+        return False
+    bridge_stop.clear()
     bridge_thread = threading.Thread(target=bridge_loop, daemon=True)
     bridge_thread.start()
+    return True
 
 
-def stop_bridge():
+def stop_bridge(timeout: float = 3.0) -> bool:
     bridge_stop.set()
+    if bridge_socket is not None:
+        try:
+            bridge_socket.close()
+        except Exception:
+            pass
     if bridge_thread:
-        bridge_thread.join(timeout=3)
+        bridge_thread.join(timeout=timeout)
+    return not (bridge_thread and bridge_thread.is_alive())
 
 
-def restart_bridge():
-    stop_bridge()
-    start_bridge()
+def restart_bridge() -> bool:
+    with bridge_lock:
+        stopped = stop_bridge()
+        started = start_bridge()
+    return stopped and (started or (bridge_thread is not None and bridge_thread.is_alive()))
 
 # ── Boot (Task Scheduler) ─────────────────────────────────────────────────────
 
@@ -336,6 +427,32 @@ input:checked+.sl:before{transform:translateX(19px)}
   </div>
 
   <div class="card">
+    <h3>LED Hardware Alignment</h3>
+    <p style="font-size:12px;color:#777;margin-bottom:12px">Shift indices to align physical lights with screen edges in real-time.</p>
+    <div style="display:flex;gap:10px;align-items:center;margin-bottom:12px">
+      <span style="font-size:13px;width:60px">Rotation</span>
+      <button class="btn btn-s" style="padding:6px 14px" onclick="shiftMapping(-1)">&#8592; -1</button>
+      <span id="map-offset" style="font-size:16px;font-weight:bold;width:30px;text-align:center">0</span>
+      <button class="btn btn-s" style="padding:6px 14px" onclick="shiftMapping(1)">+1 &#8594;</button>
+    </div>
+    <div style="display:flex;gap:10px;align-items:center;margin-bottom:12px">
+      <span style="font-size:13px;width:60px">Reverse</span>
+      <label class="sw"><input type="checkbox" id="map-rev" onchange="toggleRev()"><span class="sl"></span></label>
+    </div>
+    <div style="display:flex;gap:10px;align-items:center;">
+      <span style="font-size:13px;width:60px">Color Order</span>
+      <select id="color-order" onchange="changeColorOrder()" style="background:#252545;color:#e0e0e0;border:none;padding:5px 8px;border-radius:4px;outline:none;font-size:13px;">
+        <option value="RGB">RGB (Standard)</option>
+        <option value="GRB">GRB</option>
+        <option value="BGR">BGR</option>
+        <option value="RBG">RBG</option>
+        <option value="GBR">GBR</option>
+        <option value="BRG">BRG</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="card">
     <h3>Settings</h3>
     <div class="row" style="margin-bottom:14px">
       <div>
@@ -346,18 +463,28 @@ input:checked+.sl:before{transform:translateX(19px)}
         <label>UDP Port</label>
         <input type="number" id="port" placeholder="21324">
       </div>
-    </div>
-    <div class="row" style="margin-bottom:14px">
       <div>
-        <label>SyncLight LED Count</label>
-        <input type="number" id="led_count" placeholder="80" min="1" max="80">
+        <label>LED Count</label>
+        <input type="number" id="led_count" placeholder="80" min="1" max="240">
       </div>
     </div>
     <div class="togrow" style="margin-bottom:16px">
       <span class="toglabel">Run on System Boot</span>
       <label class="sw"><input type="checkbox" id="boot"><span class="sl"></span></label>
     </div>
+    <div class="togrow" style="margin-bottom:16px">
+      <span class="toglabel">Show Live Debug Panel</span>
+      <label class="sw"><input type="checkbox" id="debug_view"><span class="sl"></span></label>
+    </div>
     <button class="btn btn-p" onclick="save()">Save &amp; Restart Bridge</button>
+  </div>
+
+  <div class="card" id="debug-card" style="display:none">
+    <h3>Live Debug View</h3>
+    <div style="font-size:12px;color:#777;margin-bottom:4px">Prismatik Zones (Hover to see Zone ID & Color)</div>
+    <div id="strip-in" style="display:flex;gap:3px;flex-wrap:wrap;margin-bottom:12px"></div>
+    <div style="font-size:12px;color:#777;margin-bottom:4px">LED Hardware Output (Hover to see mapped Region & Color)</div>
+    <div id="strip-out" style="display:flex;gap:3px;flex-wrap:wrap"></div>
   </div>
 
   <div class="card">
@@ -377,6 +504,13 @@ input:checked+.sl:before{transform:translateX(19px)}
 
 </div>
 <script>
+function showMsg(text, isError=false){
+  const m=document.getElementById('umsg');
+  m.style.display='block';
+  m.style.color=isError?'#ff4455':'#888';
+  m.textContent=text;
+}
+
 async function poll(){
   try{
     const d=await(await fetch('/api/status')).json();
@@ -390,34 +524,82 @@ async function poll(){
     document.getElementById('hex-val').textContent=hex;
     document.getElementById('pkts').textContent=d.packets;
     document.getElementById('listen').textContent=d.config.ip+':'+d.config.port;
-    document.getElementById('ip').value=d.config.ip;
-    document.getElementById('port').value=d.config.port;
-    document.getElementById('led_count').value=d.config.led_count;
-    document.getElementById('boot').checked=d.config.run_on_boot;
+    if(document.activeElement.id !== 'ip') { document.getElementById('ip').value=d.config.ip; }
+    if(document.activeElement.id !== 'port') { document.getElementById('port').value=d.config.port; }
+    if(document.activeElement.id !== 'led_count') { document.getElementById('led_count').value=d.config.led_count || 80; }
+    if(document.activeElement.id !== 'boot') { document.getElementById('boot').checked=d.config.run_on_boot; }
+    if(document.activeElement.id !== 'debug_view') { document.getElementById('debug_view').checked=!!d.config.debug_view; }
     document.getElementById('ver').textContent=d.version;
+    document.getElementById('map-offset').textContent = d.config.zone_offset !== undefined ? d.config.zone_offset : 0;
+    if(document.activeElement.id !== 'map-rev') { document.getElementById('map-rev').checked = d.config.zone_reverse || false; }
+    if(document.activeElement.id !== 'color-order') { document.getElementById('color-order').value = d.config.color_order || 'RGB'; }
+    document.getElementById('debug-card').style.display = d.config.debug_view ? 'block' : 'none';
+    if(d.config.debug_view && d.input_colors) {
+      document.getElementById('strip-in').innerHTML = d.input_colors.map((c,i) => `<div title="Prismatik Zone ${i}: RGB(${c[0]},${c[1]},${c[2]})" style="width:28px;height:28px;border-radius:3px;background:rgb(${c[0]},${c[1]},${c[2]});border:1px solid #335;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:bold;color:#fff;text-shadow:0 0 3px #000, 0 0 3px #000;">${i}</div>`).join('');
+    }
+    if(d.config.debug_view && d.output_colors && d.mapping_indices) {
+      document.getElementById('strip-out').innerHTML = d.output_colors.map((c,i) => `<div title="LED ${i} (mapped from Zone ${d.mapping_indices[i]}): RGB(${c[0]},${c[1]},${c[2]})" style="position:relative;width:28px;height:28px;border-radius:3px;background:rgb(${c[0]},${c[1]},${c[2]});border:1px solid #335;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:bold;color:#fff;text-shadow:0 0 3px #000, 0 0 3px #000;margin-bottom:14px">${i}<div style="position:absolute;bottom:-16px;font-size:10px;color:#888;font-weight:normal;text-shadow:none">z${d.mapping_indices[i]}</div></div>`).join('');
+    }
+    if(!d.config.debug_view){
+      document.getElementById('strip-in').innerHTML = '';
+      document.getElementById('strip-out').innerHTML = '';
+    }
   }catch(e){}
 }
+async function shiftMapping(delta){
+  const el = document.getElementById('map-offset');
+  const next = (parseInt(el.textContent) || 0) + delta;
+  el.textContent = next;
+  await fetch('/api/mapping', {method:'POST', body:JSON.stringify({zone_offset: next})});
+}
+async function toggleRev(){
+  const rev = document.getElementById('map-rev').checked;
+  await fetch('/api/mapping', {method:'POST', body:JSON.stringify({zone_reverse: rev})});
+}
+async function changeColorOrder(){
+  const val = document.getElementById('color-order').value;
+  await fetch('/api/mapping', {method:'POST', body:JSON.stringify({color_order: val})});
+}
 async function save(){
-  await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},
+  const portRaw = parseInt(document.getElementById('port').value, 10);
+  const ledRaw = parseInt(document.getElementById('led_count').value, 10);
+  const safePort = Number.isFinite(portRaw) ? portRaw : 21324;
+  const safeLedCount = Number.isFinite(ledRaw) ? ledRaw : 80;
+  showMsg('Saving settings and restarting bridge...');
+  const res = await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({ip:document.getElementById('ip').value,
-      port:parseInt(document.getElementById('port').value),
-      led_count:parseInt(document.getElementById('led_count').value)||80,
-      run_on_boot:document.getElementById('boot').checked})});
-  setTimeout(poll,1200);
+      port:safePort,
+      led_count:safeLedCount,
+      run_on_boot:document.getElementById('boot').checked,
+      debug_view:document.getElementById('debug_view').checked})});
+  const body = await res.json();
+  showMsg(body.ok ? 'Saved. Bridge restarted.' : (body.error || 'Save failed.'), !body.ok);
+  setTimeout(poll,500);
 }
 async function doRestart(){
-  await fetch('/api/restart');
-  setTimeout(poll,1500);
+  showMsg('Restarting bridge...');
+  const res = await fetch('/api/restart',{method:'POST'});
+  const body = await res.json();
+  showMsg(body.ok ? 'Bridge restarted.' : (body.error || 'Restart failed.'), !body.ok);
+  setTimeout(poll,500);
 }
 async function checkUpdate(){
-  const m=document.getElementById('umsg');
-  m.style.display='block'; m.textContent='Checking...';
-  const d=await(await fetch('/api/check_update')).json();
-  if(d.error){m.textContent='Error: '+d.error;}
-  else if(d.update_available){m.innerHTML='Update available: v'+d.latest+' (current: v'+d.current+') — <a href="https://github.com/GITHUB_REPO_PLACEHOLDER/releases" target="_blank" style="color:#00c8ff">Download</a>';}
-  else{m.textContent='You are up to date (v'+d.current+')';}
+  showMsg('Checking for updates...');
+  try{
+    const d=await(await fetch('/api/check_update')).json();
+    if(d.error){showMsg('Update check failed: '+d.error,true);}
+    else if(d.update_available){
+      const m=document.getElementById('umsg');
+      m.style.display='block';
+      m.style.color='#888';
+      m.innerHTML='Update available: v'+d.latest+' (current: v'+d.current+') — <a href="https://github.com/GITHUB_REPO_PLACEHOLDER/releases" target="_blank" style="color:#00c8ff">Download</a>';
+    }
+    else{showMsg('You are up to date (v'+d.current+')');}
+  }catch(e){
+    showMsg('Update check failed: network error', true);
+  }
 }
-poll(); setInterval(poll,2000);
+poll(); setInterval(poll,500);
 </script>
 </body>
 </html>"""
@@ -435,6 +617,19 @@ def api_status():
     return jsonify({**bridge_status, "config": config, "version": VERSION})
 
 
+@app.route("/api/mapping", methods=["POST"])
+def api_mapping():
+    data = request.get_json(force=True)
+    if "zone_offset" in data:
+        config["zone_offset"] = int(data["zone_offset"])
+    if "zone_reverse" in data:
+        config["zone_reverse"] = bool(data["zone_reverse"])
+    if "color_order" in data:
+        config["color_order"] = str(data["color_order"])
+    save_config()
+    return jsonify({"ok": True})
+
+
 @app.route("/api/save", methods=["POST"])
 def api_save():
     data = request.get_json(force=True)
@@ -443,37 +638,55 @@ def api_save():
         config["ip"] = data["ip"]
         changed = True
     if "port" in data:
-        config["port"] = int(data["port"])
+        config["port"] = _safe_int(data["port"], config.get("port", 21324), 1, 65535)
         changed = True
     if "led_count" in data:
-        config["led_count"] = max(1, int(data["led_count"]))
+        config["led_count"] = _safe_int(data["led_count"], get_led_count(), 1, 240)
+        changed = True
+    if "debug_view" in data:
+        config["debug_view"] = bool(data["debug_view"])
         changed = True
     if "run_on_boot" in data:
         set_boot(bool(data["run_on_boot"]))
     if changed:
         save_config()
-        threading.Thread(target=restart_bridge, daemon=True).start()
+        restarted = restart_bridge()
+        if not restarted:
+            return jsonify({"ok": False, "error": "Bridge restart timed out"})
     return jsonify({"ok": True})
 
 
-@app.route("/api/restart")
+@app.route("/api/restart", methods=["POST"])
 def api_restart():
-    threading.Thread(target=restart_bridge, daemon=True).start()
+    restarted = restart_bridge()
+    if not restarted:
+        return jsonify({"ok": False, "error": "Bridge restart timed out"})
     return jsonify({"ok": True})
 
 
 @app.route("/api/check_update")
 def api_check_update():
-    try:
-        url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-        req = urlreq.Request(url, headers={"User-Agent": "synclight-bridge"})
-        with urlreq.urlopen(req, timeout=5) as r:
-            data = json.loads(r.read())
-        latest = data["tag_name"].lstrip("v")
-        return jsonify({"current": VERSION, "latest": latest,
-                        "update_available": latest != VERSION})
-    except Exception as e:
-        return jsonify({"error": str(e)})
+  try:
+    url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+    req = urlreq.Request(
+      url,
+      headers={
+        "User-Agent": "synclight-bridge",
+        "Accept": "application/vnd.github+json",
+      },
+    )
+    with urlreq.urlopen(req, timeout=5) as r:
+      data = json.loads(r.read())
+    if "tag_name" not in data:
+      return jsonify({"error": data.get("message", "Invalid release response")})
+    latest = str(data["tag_name"]).lstrip("v")
+    return jsonify({
+      "current": VERSION,
+      "latest": latest,
+      "update_available": latest != VERSION,
+    })
+  except Exception as e:
+    return jsonify({"error": str(e)})
 
 
 # ── Tray Icon ─────────────────────────────────────────────────────────────────
